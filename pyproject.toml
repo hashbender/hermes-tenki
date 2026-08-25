@@ -1,0 +1,6 @@
+# This repo is a hermes-agent directory plugin, not a pip package — the repo
+# root IS the plugin directory (plugin.yaml + __init__.py). This file only
+# carries tool configuration for development.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

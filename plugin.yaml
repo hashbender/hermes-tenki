@@ -1,0 +1,18 @@
+name: tenki
+version: 1.0.0
+description: "Tenki cloud sandbox terminal backend (select with terminal.backend: tenki)"
+author: hashbender
+kind: backend
+manifest_version: 2
+license: MIT
+homepage: https://github.com/hashbender/hermes-tenki
+tags: [terminal, sandbox, cloud]
+python_dependencies:
+  - "tenki>=0.5.1,<0.7"
+optional_env:
+  - name: TENKI_AUTH_TOKEN
+    description: Tenki auth token (alternatives - TENKI_API_KEY, or `tenki login`)
+    secret: true
+  - name: TENKI_API_KEY
+    description: Tenki API key (alternative to TENKI_AUTH_TOKEN / `tenki login`)
+    secret: true

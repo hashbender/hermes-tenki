@@ -1,0 +1,39 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out hermes-agent (main)
+        uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          path: hermes-agent
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install hermes-agent
+        working-directory: hermes-agent
+        run: uv sync --extra dev
+
+      - name: Install tenki SDK
+        working-directory: hermes-agent
+        run: uv pip install --python .venv/bin/python 'tenki>=0.5.1,<0.7'
+
+      - name: Run plugin tests
+        run: hermes-agent/.venv/bin/python -m pytest tests/ -q
+        env:
+          # The suite is hermetic, but never let runner credentials near it.
+          TENKI_AUTH_TOKEN: ""
+          TENKI_API_KEY: ""

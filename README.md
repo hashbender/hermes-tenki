@@ -24,6 +24,10 @@ hermes config set terminal.backend tenki
 
 Or run the wizard: `hermes setup terminal` and pick **Tenki**.
 
+The installer's security scan will show a *caution* summary and ask for
+confirmation — expected for a sandbox backend: the code legitimately
+rewrites `sudo` invocations and drives the sandbox's remote `exec` API.
+
 Auth (any one of):
 
 - `tenki login` (uses the Tenki CLI's config)
@@ -61,7 +65,11 @@ Notes:
 - **Terminate-only by default.** Unlike container backends, an unset
   `container_persistent` means the sandbox is terminated at session end
   (after a durable snapshot when persistence *is* enabled). Set
-  `terminal.container_persistent: true` explicitly to keep state.
+  `terminal.container_persistent: true` in config.yaml (or
+  `TERMINAL_CONTAINER_PERSISTENT=true` in `~/.hermes/.env`) explicitly to
+  keep state. A plain shell-exported variable is deliberately ignored for
+  this one key: core's config bridge backfills it from generic defaults, so
+  a process-env value can't prove user intent.
 - **Credentials never enter the sandbox** unless you opt in: the control
   plane token (`TENKI_AUTH_TOKEN`/`TENKI_API_KEY`) is stripped from every
   agent subprocess and is only forwarded into the guest if you list it in
@@ -69,6 +77,10 @@ Notes:
 - `hermes config set terminal.tenki_image ...` prints an "unknown key"
   warning on current hermes-agent (core's schema doesn't know plugin keys);
   the value is still written and honored.
+- **When uninstalling or disabling the plugin**, also remove
+  `TENKI_AUTH_TOKEN`/`TENKI_API_KEY` from `~/.hermes/.env`: the subprocess
+  secret-stripping the plugin registers only applies while it is loaded, so
+  a leftover token would become readable by model-authored shell commands.
 
 ## Core version compatibility
 

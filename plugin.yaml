@@ -3,7 +3,9 @@ version: 1.0.0
 description: "Tenki cloud sandbox terminal backend (select with terminal.backend: tenki)"
 author: hashbender
 kind: backend
-manifest_version: 2
+# manifest_version deliberately omitted (defaults to 1): `hermes plugins
+# install` refuses manifests newer than its own max (1 on current cores),
+# while the v2-era fields below parse fine on a v1 manifest.
 license: MIT
 homepage: https://github.com/hashbender/hermes-tenki
 tags: [terminal, sandbox, cloud]

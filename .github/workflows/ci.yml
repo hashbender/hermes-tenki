@@ -37,3 +37,38 @@ jobs:
           # The suite is hermetic, but never let runner credentials near it.
           TENKI_AUTH_TOKEN: ""
           TENKI_API_KEY: ""
+
+      - name: Installability gate (manifest + security scan)
+        run: |
+          # Scan a clean export of the plugin tree — the workspace also holds
+          # the nested hermes-agent/ checkout, which is not part of the plugin.
+          SCAN_DIR="$(mktemp -d)"
+          git archive HEAD | tar -x -C "$SCAN_DIR"
+          SCAN_DIR="$SCAN_DIR" hermes-agent/.venv/bin/python - <<'EOF'
+          import os
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, "hermes-agent")
+          import yaml
+
+          scan_dir = Path(os.environ["SCAN_DIR"])
+          manifest = yaml.safe_load((scan_dir / "plugin.yaml").read_text())
+          mv = int(manifest.get("manifest_version", 1) or 1)
+          assert mv <= 1, (
+              f"manifest_version {mv} would be refused by `hermes plugins "
+              "install` (installer max is 1)"
+          )
+          from tools.plugin_guard import scan_plugin, should_allow_plugin_install
+
+          report = scan_plugin(scan_dir)
+          verdict = getattr(report, "verdict", "?")
+          allowed, reason = should_allow_plugin_install(report)
+          print(f"scan verdict: {verdict} ({reason})")
+          # False = hard block (dangerous); None = installable after the
+          # user confirms (expected for a sandbox backend that mentions
+          # sudo/exec); True = clean.
+          assert allowed is not False, (
+              f"plugin_guard would block `hermes plugins install`: {reason}"
+          )
+          EOF

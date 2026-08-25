@@ -88,6 +88,47 @@ GetFilesFn = Callable[[], list[tuple[str, str]]]  # () -> [(host_path, remote_pa
 GetUploadOnlyHostPathsFn = Callable[[], set[str]]
 
 
+def _load_profile_config_credential_files() -> list:
+    """``terminal.credential_files`` mounts for the ACTIVE profile, uncached.
+
+    Mirrors ``credential_files._load_config_files`` minus its process-wide
+    cache, so the enumeration always reflects the active profile's config.
+    """
+    result: list = []
+    try:
+        from hermes_cli.config import cfg_get, read_raw_config
+        from tools.credential_files import _resolve_hermes_home
+        from tools.path_security import validate_within_dir
+
+        hermes_home = _resolve_hermes_home()
+        cred_files = cfg_get(read_raw_config(), "terminal", "credential_files")
+        if isinstance(cred_files, list):
+            for item in cred_files:
+                if not (isinstance(item, str) and item.strip()):
+                    continue
+                rel = item.strip()
+                if os.path.isabs(rel):
+                    logger.warning(
+                        "credential_files: rejected absolute config path %r", rel,
+                    )
+                    continue
+                host_path = hermes_home / rel
+                if validate_within_dir(host_path, hermes_home):
+                    logger.warning(
+                        "credential_files: rejected config path traversal %r", rel,
+                    )
+                    continue
+                resolved_path = host_path.resolve()
+                if resolved_path.is_file():
+                    result.append({
+                        "host_path": str(resolved_path),
+                        "container_path": f"/root/.hermes/{rel}",
+                    })
+    except Exception as exc:
+        logger.warning("Could not read terminal.credential_files from config: %s", exc)
+    return result
+
+
 def _get_credential_file_mounts_profile_scoped() -> list:
     """Credential mounts for the ACTIVE profile, on any core version.
 
@@ -95,19 +136,33 @@ def _get_credential_file_mounts_profile_scoped() -> list:
     hermes home, so the cached lookup is already profile-correct. Older cores
     cache the config-derived list in a process-wide singleton, which pins the
     FIRST profile's mount list for every later profile in the process; there,
-    the singleton is invalidated around the call so each enumeration re-reads
-    the active profile's config (and no profile's list is left pinned for
-    other consumers either).
+    the config-derived part is re-read locally (see
+    :func:`_load_profile_config_credential_files`) and merged with the
+    skill-registered files the same way ``get_credential_file_mounts`` does.
+    The core singleton is never touched — mutating it would race core's own
+    unsynchronized readers.
     """
     from tools import credential_files
 
     if isinstance(getattr(credential_files, "_config_files", None), dict):
         return credential_files.get_credential_file_mounts()
-    credential_files._config_files = None
+
+    mounts: dict = {}
     try:
-        return credential_files.get_credential_file_mounts()
-    finally:
-        credential_files._config_files = None
+        registered = credential_files._get_registered()
+    except Exception:
+        registered = {}
+    for container_path, host_path in registered.items():
+        if Path(host_path).is_file():
+            mounts[container_path] = host_path
+    for entry in _load_profile_config_credential_files():
+        cp = entry["container_path"]
+        if cp not in mounts and Path(entry["host_path"]).is_file():
+            mounts[cp] = entry["host_path"]
+    return [
+        {"host_path": hp, "container_path": cp}
+        for cp, hp in mounts.items()
+    ]
 
 
 def iter_sync_files(container_base: str = "/root/.hermes") -> list[tuple[str, str]]:

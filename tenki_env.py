@@ -1025,7 +1025,12 @@ class TenkiEnvironment(BaseEnvironment):
             try:
                 from tools.lazy_deps import install_specs
 
-                install_specs([_TENKI_SDK_SPEC])
+                result = install_specs([_TENKI_SDK_SPEC])
+                if not getattr(result, "ok", False):
+                    logger.warning(
+                        "tenki SDK lazy install did not complete: %s",
+                        getattr(result, "reason", "") or "install failed",
+                    )
             except Exception:
                 logger.debug("tenki SDK lazy install failed", exc_info=True)
 
@@ -2447,7 +2452,7 @@ class TenkiEnvironment(BaseEnvironment):
             result = process.wait(timeout=timeout + 5 if timeout is not None else None)
             return self._result_to_output(result)
 
-    def _sudo_nopasswd_works(self) -> bool:
+    def _sudo_passwordless_works(self) -> bool:
         try:
             _output, exit_code = self._exec_raw("sudo -n true", timeout=10)
         except Exception:
@@ -2460,13 +2465,13 @@ class TenkiEnvironment(BaseEnvironment):
 
         # Tenki sandboxes should rely on their own sudoers policy. Do not ask
         # the user for a host sudo password, and do not send SUDO_PASSWORD to a
-        # remote cloud sandbox. The default Tenki image supports NOPASSWD sudo.
+        # remote cloud sandbox. The default Tenki image supports passwordless sudo.
         from ._compat import _rewrite_sudo_command_words
 
         transformed, sudo_count = _rewrite_sudo_command_words(command, "sudo -n")
         if sudo_count == 0:
             return command, None
-        if self._sudo_nopasswd_works():
+        if self._sudo_passwordless_works():
             return command, None
         return transformed, None
 

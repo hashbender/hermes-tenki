@@ -80,6 +80,11 @@ def _hermetic_environment(monkeypatch, tmp_path):
     """
     for name in _SCRUBBED_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
+    # Pin (not just delete) the Tenki CLI config path: unset, it falls back
+    # to the developer's real ~/.config/tenki/config.yaml, so a test that
+    # forgets to set it would read a real `tenki login` credential and pass
+    # locally while failing in CI.
+    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "absent-tenki-cli.yaml"))
     hermes_home = tmp_path / "hermes-home"
     hermes_home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))

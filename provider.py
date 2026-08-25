@@ -62,13 +62,30 @@ def _sdk_missing() -> bool:
 
 
 def _terminal_settings() -> Dict[str, Any]:
-    """The ``terminal:`` section the USER wrote in config.yaml; ``{}`` fail-soft.
+    """The merged ``terminal:`` config section; ``{}`` fail-soft.
 
-    The raw (defaults-free) view matters: key presence is how the provider
-    distinguishes an explicit user choice from core's generic defaults —
-    ``container_persistent`` in particular defaults to ``true`` in core's
-    merged config, which must not read as an explicit opt-in to persistent
-    cloud sandboxes.
+    The merged view (managed-scope overlays, ``${ENV_VAR}`` expansion) is
+    what values must be read from. Core ships no defaults for ``tenki_*``
+    keys, so for those merged == what the user wrote.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        section = load_config_readonly().get("terminal", {})
+        return section if isinstance(section, dict) else {}
+    except Exception:
+        logger.debug("Tenki provider: terminal config unavailable", exc_info=True)
+        return {}
+
+
+def _raw_terminal_settings() -> Dict[str, Any]:
+    """The ``terminal:`` section the USER actually wrote; ``{}`` fail-soft.
+
+    Used only for key-PRESENCE checks: the raw (defaults-free) view is how
+    the provider distinguishes an explicit user choice from core's generic
+    defaults — ``container_persistent`` in particular defaults to ``true``
+    in the merged config, which must not read as an explicit opt-in to
+    persistent cloud sandboxes.
     """
     try:
         from hermes_cli.config import read_raw_config_readonly
@@ -76,8 +93,23 @@ def _terminal_settings() -> Dict[str, Any]:
         section = read_raw_config_readonly().get("terminal", {})
         return section if isinstance(section, dict) else {}
     except Exception:
-        logger.debug("Tenki provider: terminal config unavailable", exc_info=True)
+        logger.debug("Tenki provider: raw terminal config unavailable", exc_info=True)
         return {}
+
+
+def _dotenv_value(key: str) -> Optional[str]:
+    """The value ``~/.hermes/.env`` itself assigns to *key*, or ``None``.
+
+    Deliberately NOT the process environment: core's config→env bridge
+    backfills unset ``TERMINAL_*`` vars from merged-config defaults, so a
+    process-env value cannot prove user intent — a ``.env`` entry can.
+    """
+    try:
+        from hermes_cli.config import load_env
+
+        return load_env().get(key)
+    except Exception:
+        return None
 
 
 def _as_bool(value: Any, default: bool) -> bool:
@@ -90,23 +122,34 @@ def _as_bool(value: Any, default: bool) -> bool:
     return bool(value)
 
 
-def _as_int(value: Any, default: int) -> int:
+def _as_int(value: Any, default: int, *, setting: str) -> int:
+    if value is None:
+        return default
     try:
         return int(value)
     except (TypeError, ValueError):
-        return default
+        raise ValueError(
+            f"Invalid {setting} value {value!r}: expected a number"
+        ) from None
 
 
-def _as_list(value: Any, default: Optional[list] = None) -> list:
+def _as_list(value: Any, *, setting: str) -> list:
+    if value is None:
+        return []
     if isinstance(value, list):
         return value
-    if isinstance(value, str) and value.strip():
+    if isinstance(value, str):
+        if not value.strip():
+            return []
         try:
             parsed = json.loads(value)
         except ValueError:
-            return default or []
-        return parsed if isinstance(parsed, list) else (default or [])
-    return default or []
+            raise ValueError(
+                f"Invalid {setting} value {value!r}: expected a JSON list"
+            ) from None
+        if isinstance(parsed, list):
+            return parsed
+    raise ValueError(f"Invalid {setting} value {value!r}: expected a list")
 
 
 def _setting(settings: Dict[str, Any], key: str, env_var: str) -> Any:
@@ -176,24 +219,21 @@ class TenkiProvider(TerminalEnvironmentProvider):
         import importlib
 
         if _sdk_missing():
+            detail = ""
             try:
                 from tools.lazy_deps import install_specs
 
-                install_specs([_SDK_SPEC])
+                result = install_specs([_SDK_SPEC])
+                detail = getattr(result, "reason", "") or ""
                 importlib.invalidate_caches()
             except Exception as exc:
-                logger.error(
-                    "tenki is required for the Tenki terminal backend: "
-                    "pip install '%s' (%s)",
-                    _SDK_SPEC,
-                    exc,
-                )
-                return False
+                detail = str(exc)
             if _sdk_missing():
                 logger.error(
                     "tenki is required for the Tenki terminal backend: "
-                    "pip install '%s'",
+                    "pip install '%s'%s",
                     _SDK_SPEC,
+                    f" ({detail})" if detail else "",
                 )
                 return False
         try:
@@ -289,8 +329,16 @@ class TenkiProvider(TerminalEnvironmentProvider):
             try:
                 from tools.lazy_deps import install_specs
 
-                install_specs([_SDK_SPEC])
+                result = install_specs([_SDK_SPEC])
                 importlib.invalidate_caches()
+                if getattr(result, "ok", False) and not _sdk_missing():
+                    print("Tenki SDK installed")
+                else:
+                    reason = getattr(result, "reason", "") or "install failed"
+                    print(
+                        f"Install did not complete ({reason}) — run manually: "
+                        f"pip install '{_SDK_SPEC}'"
+                    )
             except Exception as exc:
                 print(
                     f"Install failed — run manually: pip install '{_SDK_SPEC}' ({exc})"
@@ -354,8 +402,21 @@ class TenkiProvider(TerminalEnvironmentProvider):
         cc = container_config or {}
         settings = _terminal_settings()
 
+        # RL/benchmark harnesses register per-task overrides; honor the
+        # per-task image the way the image ladders do for built-in backends.
+        override_image = ""
+        try:
+            from tools.terminal_tool import resolve_task_overrides
+
+            override_image = str(
+                resolve_task_overrides(task_id).get("tenki_image") or ""
+            )
+        except Exception:
+            logger.debug("Tenki provider: task overrides unavailable", exc_info=True)
+
         return TenkiEnvironment(
-            image=image
+            image=override_image
+            or image
             or str(_setting(settings, "tenki_image", "TERMINAL_TENKI_IMAGE") or ""),
             cwd=self._resolve_cwd(cwd, settings),
             timeout=timeout,
@@ -385,14 +446,17 @@ class TenkiProvider(TerminalEnvironmentProvider):
             max_duration=_as_int(
                 _setting(settings, "tenki_max_duration", "TERMINAL_TENKI_MAX_DURATION"),
                 3600,
+                setting="tenki_max_duration",
             ),
             idle_timeout=_as_int(
                 _setting(settings, "tenki_idle_timeout", "TERMINAL_TENKI_IDLE_TIMEOUT"),
                 0,
+                setting="tenki_idle_timeout",
             ),
             pause_retention=_as_int(
                 _setting(settings, "tenki_pause_retention", "TERMINAL_TENKI_PAUSE_RETENTION"),
                 0,
+                setting="tenki_pause_retention",
             ),
             sync_hermes_home=_as_bool(
                 _setting(
@@ -401,7 +465,8 @@ class TenkiProvider(TerminalEnvironmentProvider):
                 False,
             ),
             forward_env=_as_list(
-                _setting(settings, "tenki_forward_env", "TERMINAL_TENKI_FORWARD_ENV")
+                _setting(settings, "tenki_forward_env", "TERMINAL_TENKI_FORWARD_ENV"),
+                setting="tenki_forward_env",
             ),
         )
 
@@ -428,16 +493,55 @@ class TenkiProvider(TerminalEnvironmentProvider):
         return _GUEST_HOME
 
     @staticmethod
-    def _resolve_persistent(settings: Dict[str, Any]) -> bool:
-        """Terminate-only by default; honor only an explicit user setting.
+    def _explicit_persistent_setting() -> Optional[bool]:
+        """The user's explicit ``container_persistent`` choice, or ``None``.
 
-        ``container_config["container_persistent"]`` cannot be used here:
-        core fills it with the generic default ``True`` when the user set
-        nothing, which is indistinguishable from an explicit ``true``.
+        Only two sources can prove intent: the key written in config.yaml
+        (raw view — the merged view carries core's generic ``true`` default)
+        and an assignment in ``~/.hermes/.env``. The process env var cannot:
+        core's config→env bridge backfills it from merged-config defaults,
+        and ``container_config["container_persistent"]`` arrives pre-filled
+        with the same default.
         """
-        if "container_persistent" in settings:
-            return _as_bool(settings["container_persistent"], False)
-        env_value = os.environ.get("TERMINAL_CONTAINER_PERSISTENT")
-        if env_value is not None:
-            return _as_bool(env_value, False)
-        return False
+        raw = _raw_terminal_settings()
+        if "container_persistent" in raw:
+            return _as_bool(raw["container_persistent"], False)
+        dotenv = _dotenv_value("TERMINAL_CONTAINER_PERSISTENT")
+        if dotenv is not None:
+            return _as_bool(dotenv, False)
+        return None
+
+    @classmethod
+    def _resolve_persistent(cls, settings: Dict[str, Any]) -> bool:
+        """Terminate-only unless the user explicitly opted into persistence."""
+        explicit = cls._explicit_persistent_setting()
+        return False if explicit is None else explicit
+
+    @classmethod
+    def seed_process_defaults(cls) -> None:
+        """Align core's process-env view with this backend's defaults.
+
+        Core gates per-session sandbox isolation on
+        ``TERMINAL_CONTAINER_PERSISTENT`` (default ``"true"``), while this
+        backend is terminate-only by default — left unreconciled, core would
+        collapse ephemeral sessions onto one shared sandbox identity that
+        the plugin then terminates, defeating the
+        ``session_isolated_when_nonpersistent`` contract. When Tenki is the
+        selected backend and the user made no explicit persistence choice,
+        export the backend's ``false`` default so core and plugin agree —
+        the same normalization the in-core integration performed on the
+        merged config defaults.
+        """
+        try:
+            backend = str(
+                _raw_terminal_settings().get("backend")
+                or _dotenv_value("TERMINAL_ENV")
+                or os.environ.get("TERMINAL_ENV")
+                or ""
+            ).strip().lower()
+            if backend != "tenki":
+                return
+            if cls._explicit_persistent_setting() is None:
+                os.environ["TERMINAL_CONTAINER_PERSISTENT"] = "false"
+        except Exception:
+            logger.debug("Tenki provider: default seeding failed", exc_info=True)

@@ -164,6 +164,15 @@ def test_persistence_defaults_to_terminate_only(capture_env):
     assert capture_env.created_kwargs["persistent_filesystem"] is False
 
 
+def test_persistence_ignores_bridge_backfilled_process_env(capture_env, monkeypatch):
+    # Core's config→env bridge backfills TERMINAL_CONTAINER_PERSISTENT="True"
+    # from the merged-config default; a process-env value therefore cannot
+    # prove user intent and must not flip the terminate-only default.
+    monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "True")
+    TenkiProvider().create_environment(cwd="/root", timeout=60, task_id="t")
+    assert capture_env.created_kwargs["persistent_filesystem"] is False
+
+
 def test_persistence_honors_explicit_config(capture_env, monkeypatch, tmp_path):
     _write_terminal_config(
         tmp_path, monkeypatch, "terminal:\n  container_persistent: true\n"
@@ -172,10 +181,67 @@ def test_persistence_honors_explicit_config(capture_env, monkeypatch, tmp_path):
     assert capture_env.created_kwargs["persistent_filesystem"] is True
 
 
-def test_persistence_honors_explicit_env(capture_env, monkeypatch):
-    monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "true")
+def test_persistence_honors_explicit_dotenv(capture_env, monkeypatch):
+    import os
+
+    with open(f"{os.environ['HERMES_HOME']}/.env", "w", encoding="utf-8") as fh:
+        fh.write("TERMINAL_CONTAINER_PERSISTENT=true\n")
     TenkiProvider().create_environment(cwd="/root", timeout=60, task_id="t")
     assert capture_env.created_kwargs["persistent_filesystem"] is True
+
+
+def test_seed_process_defaults_exports_terminate_only(monkeypatch, tmp_path):
+    # With backend=tenki selected and no explicit persistence choice, the
+    # load-time seed must align core's session-isolation gate (which reads
+    # the process env var) with the plugin's terminate-only default — even
+    # over a bridge-backfilled "True".
+    _write_terminal_config(tmp_path, monkeypatch, "terminal:\n  backend: tenki\n")
+    monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "True")
+    TenkiProvider.seed_process_defaults()
+    import os
+
+    assert os.environ["TERMINAL_CONTAINER_PERSISTENT"] == "false"
+
+
+def test_seed_process_defaults_respects_explicit_choice(monkeypatch, tmp_path):
+    _write_terminal_config(
+        tmp_path,
+        monkeypatch,
+        "terminal:\n  backend: tenki\n  container_persistent: true\n",
+    )
+    monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "True")
+    TenkiProvider.seed_process_defaults()
+    import os
+
+    assert os.environ["TERMINAL_CONTAINER_PERSISTENT"] == "True"
+
+
+def test_seed_process_defaults_leaves_other_backends_alone(monkeypatch, tmp_path):
+    _write_terminal_config(tmp_path, monkeypatch, "terminal:\n  backend: docker\n")
+    monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "True")
+    TenkiProvider.seed_process_defaults()
+    import os
+
+    assert os.environ["TERMINAL_CONTAINER_PERSISTENT"] == "True"
+
+
+def test_invalid_numeric_setting_fails_loud(capture_env, monkeypatch):
+    monkeypatch.setenv("TERMINAL_TENKI_MAX_DURATION", "not-a-number")
+    with pytest.raises(ValueError, match="tenki_max_duration"):
+        TenkiProvider().create_environment(cwd="/root", timeout=60, task_id="t")
+
+
+def test_per_task_image_override_reaches_the_factory(capture_env, monkeypatch):
+    from tools import terminal_tool
+
+    terminal_tool.register_task_env_overrides("task-img", {"tenki_image": "rl:1"})
+    try:
+        TenkiProvider().create_environment(
+            cwd="/root", timeout=60, task_id="task-img", image="core-image"
+        )
+    finally:
+        terminal_tool.clear_task_env_overrides("task-img")
+    assert capture_env.created_kwargs["image"] == "rl:1"
 
 
 def test_probe_reports_sdk_and_auth_readiness(monkeypatch, tmp_path):
@@ -184,8 +250,14 @@ def test_probe_reports_sdk_and_auth_readiness(monkeypatch, tmp_path):
 
     for name in [m for m in sys.modules if m == "tenki" or m.startswith("tenki.")]:
         monkeypatch.delitem(sys.modules, name, raising=False)
+    import importlib.util as _ilu
+
+    real_find_spec = _ilu.find_spec
     monkeypatch.setattr(
-        "importlib.util.find_spec", lambda name, *a: None if name == "tenki" else object()
+        "importlib.util.find_spec",
+        lambda name, *a, **k: None
+        if name == "tenki"
+        else real_find_spec(name, *a, **k),
     )
     status, detail = provider.probe()
     assert status == "needs_setup"

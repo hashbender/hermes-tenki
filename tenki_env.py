@@ -22,10 +22,12 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 from hermes_constants import get_hermes_home
-from tools.environments.base import (
-    BaseEnvironment,
-    _ThreadedProcessHandle,
-)
+from tools.environments.base import BaseEnvironment
+
+try:
+    from tools.environments.base_output import _ThreadedProcessHandle
+except ImportError:  # hermes-agent cores before the base.py output-module split
+    from tools.environments.base import _ThreadedProcessHandle
 
 from ._compat import (
     _atomic_save_json_durable,

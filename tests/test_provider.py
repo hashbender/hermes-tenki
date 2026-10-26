@@ -316,7 +316,10 @@ def test_registry_registration_and_terminal_dispatch(monkeypatch, tmp_path):
         monkeypatch.setattr(
             tenki_env.TenkiEnvironment, "init_session", lambda self: None
         )
-        env = terminal_tool._create_environment(
+        create_environment = getattr(terminal_tool, "_create_environment", None)
+        if create_environment is None:  # newer cores split terminal_tool.py
+            from tools.terminal_tool_backends import _create_environment as create_environment
+        env = create_environment(
             env_type="tenki",
             image="",
             cwd="/root",

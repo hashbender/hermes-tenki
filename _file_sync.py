@@ -97,10 +97,9 @@ def _load_profile_config_credential_files() -> list:
     result: list = []
     try:
         from hermes_cli.config import cfg_get, read_raw_config
-        from tools.credential_files import _resolve_hermes_home
         from tools.path_security import validate_within_dir
 
-        hermes_home = _resolve_hermes_home()
+        hermes_home = get_hermes_home()
         cred_files = cfg_get(read_raw_config(), "terminal", "credential_files")
         if isinstance(cred_files, list):
             for item in cred_files:

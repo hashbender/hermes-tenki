@@ -363,9 +363,34 @@ def _clear_env_passthrough_cache():
         import tools.env_passthrough as env_passthrough
 
         env_passthrough.clear_env_passthrough()
-        env_passthrough._config_passthrough = None
+        # Newer cores cache config passthrough per profile in a dict;
+        # older ones used a single module-level value reset to None.
+        if isinstance(env_passthrough._config_passthrough, dict):
+            env_passthrough._config_passthrough.clear()
+        else:
+            env_passthrough._config_passthrough = None
     except Exception:
         pass
+
+
+def _patch_sudo_prompt(monkeypatch, replacement):
+    """Patch core's host sudo prompt wherever this core defines/imports it.
+
+    Newer cores moved it from ``tools.terminal_tool`` to
+    ``tools.terminal_tool_sudo``; patch every module that exposes it.
+    """
+    import importlib
+
+    patched = False
+    for mod_name in ("tools.terminal_tool_sudo", "tools.terminal_tool"):
+        try:
+            module = importlib.import_module(mod_name)
+        except ImportError:
+            continue
+        if hasattr(module, "_prompt_for_sudo_password"):
+            monkeypatch.setattr(module, "_prompt_for_sudo_password", replacement)
+            patched = True
+    assert patched, "core exposes no _prompt_for_sudo_password to patch"
 
 
 def _require_core_environment_registry():
@@ -4668,7 +4693,7 @@ def test_tenki_passwordless_sudo_does_not_prompt_or_rewrite(monkeypatch, tmp_pat
     def fail_prompt(*_args, **_kwargs):
         raise AssertionError("Tenki sudo should not prompt for a host password")
 
-    monkeypatch.setattr("tools.terminal_tool._prompt_for_sudo_password", fail_prompt)
+    _patch_sudo_prompt(monkeypatch, fail_prompt)
 
     env = TenkiEnvironment(task_id="sudo-passwordless")
     env.execute("sudo whoami", timeout=5)
@@ -4697,7 +4722,7 @@ def test_tenki_sudo_without_passwordless_policy_fails_fast_without_host_password
     def fail_prompt(*_args, **_kwargs):
         raise AssertionError("Tenki sudo should not prompt for a host password")
 
-    monkeypatch.setattr("tools.terminal_tool._prompt_for_sudo_password", fail_prompt)
+    _patch_sudo_prompt(monkeypatch, fail_prompt)
 
     env = TenkiEnvironment(task_id="sudo-password-required")
     env.execute("sudo whoami", timeout=5)

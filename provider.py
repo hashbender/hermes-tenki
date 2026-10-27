@@ -33,7 +33,7 @@ from agent.terminal_env_provider import TerminalEnvironmentProvider
 
 logger = logging.getLogger(__name__)
 
-_SDK_SPEC = "tenki>=0.5.1,<0.7"
+_SDK_SPEC = "tenki>=1.4.1,<2"
 _GUEST_HOME = "/home/tenki"
 
 #: Core's prompt builder creates a live environment for remote backends at

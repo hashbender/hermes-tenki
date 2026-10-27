@@ -33,9 +33,9 @@ Auth (any one of):
 - `tenki login` (uses the Tenki CLI's config)
 - `TENKI_AUTH_TOKEN` or `TENKI_API_KEY` in the environment or `~/.hermes/.env`
 
-The `tenki` Python SDK (`tenki>=0.5.1,<0.7`) is installed on demand through
+The `tenki` Python SDK (`tenki>=1.4.1,<2`) is installed on demand through
 hermes-agent's lazy-install pipeline, or install it yourself with
-`pip install 'tenki>=0.5.1,<0.7'`.
+`pip install 'tenki>=1.4.1,<2'`.
 
 ## Configuration
 
@@ -112,7 +112,7 @@ SDK is installed and still makes no network calls):
 ```bash
 git clone https://github.com/NousResearch/hermes-agent
 cd hermes-agent && uv sync --extra dev && cd -
-uv pip install --python hermes-agent/.venv/bin/python 'tenki>=0.5.1,<0.7'
+uv pip install --python hermes-agent/.venv/bin/python 'tenki>=1.4.1,<2'
 hermes-agent/.venv/bin/python -m pytest tests/
 ```
 

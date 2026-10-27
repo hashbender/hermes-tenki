@@ -10,7 +10,7 @@ license: MIT
 homepage: https://github.com/hashbender/hermes-tenki
 tags: [terminal, sandbox, cloud]
 python_dependencies:
-  - "tenki>=0.5.1,<0.7"
+  - "tenki>=1.4.1,<2"
 optional_env:
   - name: TENKI_AUTH_TOKEN
     description: Tenki auth token (alternatives - TENKI_API_KEY, or `tenki login`)

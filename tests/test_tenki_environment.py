@@ -4906,18 +4906,20 @@ def test_installed_tenki_sdk_exposes_adapter_contract_without_network():
     } <= set(client_create)
     assert "project_id" not in client_create
     assert "workspace_id" in inspect.signature(tenki.Client.list).parameters
+    # tenki 0.5.x: Sandbox.create is a bare **kwargs passthrough to
+    # Client.create. tenki 1.x: it names the create parameters explicitly.
+    # The adapter introspects Client.create first, so either shape works.
+    sandbox_create = inspect.signature(tenki.Sandbox.create).parameters
     assert any(
         parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in inspect.signature(
-            tenki.Sandbox.create
-        ).parameters.values()
-    )
+        for parameter in sandbox_create.values()
+    ) or {"workspace_id", "image", "cpu_cores"} <= set(sandbox_create)
 
     # Client construction is local; no request is made until a resource
     # method is called. Verify cleanup/durability APIs without contacting
     # Tenki.
     client = tenki.Client(
-        auth_token="contract-test",
+        auth_token="tk_contract-test",
         base_url="https://example.invalid",
     )
     try:

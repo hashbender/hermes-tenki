@@ -63,7 +63,7 @@ _SNAPSHOT_LOCKS_GUARD = threading.Lock()
 _QUARANTINED_TASK_OWNERSHIP_FILES: list[Any] = []
 _QUARANTINED_TASK_OWNERSHIP_GUARD = threading.Lock()
 _TERMINATE_RETRY_DELAYS = (0.1, 0.5)
-_TENKI_SDK_SPEC = "tenki>=0.5.1,<0.7"
+_TENKI_SDK_SPEC = "tenki>=1.4.1,<2"
 
 try:
     import fcntl as _fcntl

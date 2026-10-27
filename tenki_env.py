@@ -879,6 +879,11 @@ def _migrate_snapshot_pointer(
             snapshots.pop(task_id, None)
 
 
+# Tenki's provisioner rejects longer session names, but only after create
+# returns: the sandbox goes straight to TERMINATED with a validation error.
+_TENKI_SESSION_NAME_MAX = 64
+
+
 def _safe_name(value: str, *, fallback: str = "default", max_len: int = 48) -> str:
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", value or "").strip("-._")
     return (safe or fallback)[:max_len]
@@ -1410,7 +1415,14 @@ class TenkiEnvironment(BaseEnvironment):
         return self._canonical_sandbox_name
 
     def _sandbox_name_for(self, profile_token: str, task_id: str) -> str:
-        return f"{self._name_prefix}-{profile_token}-{_safe_name(task_id)}"
+        name = f"{self._name_prefix}-{profile_token}-{_safe_name(task_id)}"
+        if len(name) <= _TENKI_SESSION_NAME_MAX:
+            return name
+        # Gateway task ids (``local-`` + 64 hex) always overflow. A digest of
+        # the full task id keeps truncated names distinct per task.
+        digest = hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:12]
+        head = name[: _TENKI_SESSION_NAME_MAX - len(digest) - 1].rstrip("-._")
+        return f"{head}-{digest}"
 
     @staticmethod
     def _sandbox_state(sandbox: Any) -> str:

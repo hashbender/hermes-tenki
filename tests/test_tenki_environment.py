@@ -4970,3 +4970,28 @@ def test_snapshot_unrecoverable_resolves_renamed_registry_error(monkeypatch):
         )
         is False
     )
+
+
+def test_gateway_task_ids_create_sandbox_names_tenki_can_provision(monkeypatch, tmp_path):
+    """Tenki accepts create for a session name over 64 chars, then the
+    provisioner rejects it and the sandbox lands in TERMINATED. Gateway task
+    ids (``local-`` + 64 hex) must still yield a valid, per-task name."""
+    _install_fake_tenki(monkeypatch)
+    _clear_tenki_auth_env(monkeypatch)
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "missing.yaml"))
+    monkeypatch.setenv("TENKI_API_KEY", "sk-test-key")
+
+    from hermes_tenki.tenki_env import TenkiEnvironment
+
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+    shared = "local-" + "8f01a9bda5c96e49f0098b98921762f343d21160ec494c2d53e8614c4add"
+    names = []
+    for task_id in (shared + "678d", shared + "0000"):
+        env = TenkiEnvironment(task_id=task_id)
+        names.append(_FakeSandboxFactory.created_kwargs[-1]["name"])
+        env.cleanup()
+
+    assert all(len(name) <= 64 for name in names)
+    assert names[0] != names[1]

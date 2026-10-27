@@ -341,3 +341,12 @@ def test_registered_name_does_not_collide_with_builtins():
     from agent.terminal_env_registry import BUILTIN_BACKEND_NAMES
 
     assert TenkiProvider().name not in BUILTIN_BACKEND_NAMES
+
+
+def test_cli_api_key_is_not_wrapped_as_session_cookie():
+    """`tenki login` with an API key stores ``tk_...`` in auth_token; it must be
+    sent as a bearer key, not ``cookie:tk_...`` (the API answers 401)."""
+    from hermes_tenki.tenki_config import _normalize_cli_auth_token
+
+    assert _normalize_cli_auth_token("tk_example", "auth_token") == "tk_example"
+    assert _normalize_cli_auth_token("bare-session", "auth_token") == "cookie:bare-session"

@@ -18,7 +18,9 @@ _SECRET_KEYS = frozenset({
     "token",
 })
 
-_SDK_AUTH_PREFIXES = ("cookie:", "ory_st_", "sk-")
+# Already-typed credentials passed to the SDK verbatim. ``tk_`` is a Tenki API
+# key, which newer CLIs (`tenki login` with an API key) store as ``auth_token``.
+_SDK_AUTH_PREFIXES = ("cookie:", "ory_st_", "sk-", "tk_")
 
 
 def tenki_cli_config_path() -> Path:

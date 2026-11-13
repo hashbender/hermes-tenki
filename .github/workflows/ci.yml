@@ -50,7 +50,7 @@ jobs:
           from pathlib import Path
 
           sys.path.insert(0, "hermes-agent")
-          import yaml
+          import hermes_yaml as yaml  # core dropped PyYAML for this ruamel wrapper
 
           scan_dir = Path(os.environ["SCAN_DIR"])
           manifest = yaml.safe_load((scan_dir / "plugin.yaml").read_text())

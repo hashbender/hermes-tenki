@@ -43,6 +43,7 @@ from ._file_sync import (
     unique_parent_dirs,
 )
 from .tenki_config import (
+    TENKI_AUTH_HINT,
     resolve_tenki_api_endpoint,
     resolve_tenki_auth_token,
     resolve_tenki_workspace_id,
@@ -1107,6 +1108,11 @@ class TenkiEnvironment(BaseEnvironment):
         self._api_endpoint = resolve_tenki_api_endpoint(api_endpoint)
         self._workspace_id = resolve_tenki_workspace_id(workspace_id)
         self._auth_token = resolve_tenki_auth_token()
+        if not self._auth_token:
+            # Fail before any lock, journal or RPC. An empty token would also
+            # let the SDK fall back to a raw os.environ read, bypassing the
+            # profile secret scope.
+            raise RuntimeError(f"Tenki auth not found: {TENKI_AUTH_HINT}.")
         self._name_prefix = _safe_name(name_prefix, fallback="hermes", max_len=28)
         # Every name this wrapper will ever answer to is fixed here: the prefix,
         # the profile token, and the task id never change after construction.
@@ -1344,9 +1350,8 @@ class TenkiEnvironment(BaseEnvironment):
         env.update(self._passthrough_env())
         # If the operator explicitly opted into forwarding the control-plane
         # credential (for nested-sandbox creation), supply the already-resolved
-        # token. Re-reading the env var here would miss a `tenki login`
-        # credential, which lives in the Tenki CLI config, not the environment —
-        # so the documented opt-in would silently forward nothing.
+        # token under whichever alias they listed, so listing TENKI_AUTH_TOKEN
+        # still works when the key was configured as TENKI_API_KEY.
         if self._auth_token:
             for key in ("TENKI_AUTH_TOKEN", "TENKI_API_KEY"):
                 if key in self._forward_env and not env.get(key):
@@ -1365,27 +1370,14 @@ class TenkiEnvironment(BaseEnvironment):
     def _resolve_forwarded_env(keys: list[str] | set[str] | tuple[str, ...]) -> dict[str, str]:
         if not keys:
             return {}
-        from .tenki_config import _global_credential_fallback_allowed, _scoped_env
-
-        get_env_value = None
-        if _global_credential_fallback_allowed():
-            try:
-                from hermes_cli.config import get_env_value
-            except Exception:
-                get_env_value = None
+        from .tenki_config import _scoped_env
 
         env: dict[str, str] = {}
         for key in keys:
-            # Scope-aware read first: under a multiplexed profile turn this
+            # Scope-aware read only: under a multiplexed profile turn this
             # resolves the active profile's value, never another profile's raw
-            # os.environ. The ~/.hermes/.env fallback is consulted only when no
-            # profile scope is authoritative.
+            # os.environ. Hermes loads ~/.hermes/.env into that view itself.
             value = _scoped_env(key)
-            if not value and get_env_value is not None:
-                try:
-                    value = get_env_value(key) or ""
-                except Exception:
-                    value = ""
             if value:
                 env[key] = value
         return env

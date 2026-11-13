@@ -1,49 +1,28 @@
-"""Helpers for reading Tenki CLI configuration without exposing secrets."""
+"""Tenki auth/endpoint/workspace resolution.
+
+Every value comes from Hermes: explicit ``terminal.tenki_*`` config, or an
+environment variable read through :func:`agent.secret_scope.get_secret` (which
+honours the active profile under a multiplexed gateway). The plugin never
+reads the Tenki CLI's own config/login file or any ``.env`` file; Hermes loads
+``~/.hermes/.env`` itself. Users who already ran ``tenki login`` can print a
+key for ``TENKI_API_KEY`` with ``tenki auth token``.
+"""
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
 from typing import Any
-
-from utils import fast_safe_load
 
 TENKI_DEFAULT_API_ENDPOINT = "https://api.tenki.cloud"
 
-_SECRET_KEYS = frozenset({
-    "auth_token",
-    "api_key",
-    "access_token",
-    "session_token",
-    "token",
-})
+#: Credential env vars, in precedence order. ``TENKI_API_KEY`` is the
+#: manifest's ``requires_env`` entry; ``TENKI_AUTH_TOKEN`` is the SDK's alias.
+TENKI_AUTH_ENV_VARS = ("TENKI_API_KEY", "TENKI_AUTH_TOKEN")
 
-# Already-typed credentials passed to the SDK verbatim. ``tk_`` is a Tenki API
-# key, which newer CLIs (`tenki login` with an API key) store as ``auth_token``.
-_SDK_AUTH_PREFIXES = ("cookie:", "ory_st_", "sk-", "tk_")
-
-
-def tenki_cli_config_path() -> Path:
-    """Return the Tenki CLI config path.
-
-    ``TENKI_CONFIG_PATH`` is honored for tests and uncommon CLI installs.
-    """
-    override = os.getenv("TENKI_CONFIG_PATH")
-    if override:
-        return Path(override).expanduser()
-    return Path.home() / ".config" / "tenki" / "config.yaml"
-
-
-def load_tenki_cli_config() -> dict[str, Any]:
-    """Load Tenki CLI config, returning ``{}`` on missing or invalid files."""
-    path = tenki_cli_config_path()
-    try:
-        data = fast_safe_load(path.read_text(encoding="utf-8")) or {}
-    except OSError:
-        return {}
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
+#: One-line, user-facing hint for missing credentials.
+TENKI_AUTH_HINT = (
+    "set TENKI_API_KEY in ~/.hermes/.env (`tenki auth token` prints a key "
+    "from an existing Tenki CLI login)"
+)
 
 
 def _string(value: Any) -> str:
@@ -51,10 +30,10 @@ def _string(value: Any) -> str:
 
 
 def _scoped_env(name: str) -> str:
-    """Read a credential env var honoring the active profile secret scope.
+    """Read an env var honoring the active profile secret scope.
 
     Under a multiplexed gateway turn a profile scope is installed, and the
-    token must come from *that* profile's secrets — never from a raw
+    value must come from *that* profile's secrets — never from a raw
     ``os.environ`` read that could hold another profile's value. When no
     multiplexing is active this behaves exactly like ``os.getenv``.
     """
@@ -68,71 +47,9 @@ def _scoped_env(name: str) -> str:
         return ""
 
 
-def _global_credential_fallback_allowed() -> bool:
-    """Whether machine-global credential sources (the shared Tenki CLI login)
-    may be consulted.
-
-    Skipped whenever a profile secret scope is authoritative — a multiplexed
-    profile without its own Tenki token must not borrow the machine-global
-    ``tenki login`` credential that another profile may be relying on.
-    """
-    try:
-        from agent.secret_scope import current_secret_scope, is_multiplex_active
-
-        return current_secret_scope() is None and not is_multiplex_active()
-    except Exception:
-        return True
-
-
-def _first_string(data: dict[str, Any], keys: tuple[str, ...]) -> str:
-    for key in keys:
-        value = _string(data.get(key))
-        if value:
-            return value
-    return ""
-
-
-def _normalize_cli_auth_token(secret: str, key: str) -> str:
-    """Return a Tenki SDK-compatible auth token from Tenki CLI config.
-
-    Tenki CLI v0.6 stores its browser session cookie as a bare ``auth_token``.
-    The Python SDK expects cookie credentials to be prefixed with ``cookie:``;
-    otherwise it sends the value as a bearer token and the API returns
-    ``sandbox: unauthorized``.
-    """
-    secret = _string(secret)
-    if not secret or secret.startswith(_SDK_AUTH_PREFIXES):
-        return secret
-    if key.lower() == "auth_token":
-        return f"cookie:{secret}"
-    return secret
-
-
-def _find_secret_value(data: Any) -> str:
-    if isinstance(data, dict):
-        for key, value in data.items():
-            if isinstance(key, str) and key.lower() in _SECRET_KEYS:
-                secret = _string(value)
-                if secret:
-                    return _normalize_cli_auth_token(secret, key)
-            found = _find_secret_value(value)
-            if found:
-                return found
-    elif isinstance(data, list):
-        for item in data:
-            found = _find_secret_value(item)
-            if found:
-                return found
-    return ""
-
-
 def resolve_tenki_api_endpoint(explicit: str = "") -> str:
-    """Resolve the Tenki API endpoint from config/env/CLI defaults.
-
-    Scope-aware (see :func:`_scoped_env`): under a multiplexed profile turn the
-    active profile's setting wins, and the shared machine Tenki CLI config is
-    consulted only when no profile scope is authoritative.
-    """
+    """Explicit config, then ``TENKI_API_ENDPOINT``/``TENKI_API_URL``, then
+    the public default."""
     explicit = _string(explicit)
     if explicit:
         return explicit
@@ -140,18 +57,15 @@ def resolve_tenki_api_endpoint(explicit: str = "") -> str:
         value = _scoped_env(env_name)
         if value:
             return value
-    if _global_credential_fallback_allowed():
-        cfg = load_tenki_cli_config()
-        endpoint = _first_string(cfg, ("api_endpoint", "api_url", "endpoint"))
-        if endpoint:
-            return endpoint
     return TENKI_DEFAULT_API_ENDPOINT
 
 
 def resolve_tenki_workspace_id(explicit: str = "") -> str:
-    """Resolve the Tenki workspace id. Scope-aware; the workspace decides where
-    sandboxes are created, so a multiplexed profile must not silently borrow
-    the machine-global workspace of another tenant."""
+    """Explicit config, then ``TENKI_WORKSPACE_ID``/``TENKI_WORKSPACE``.
+
+    Empty when neither is set: the SDK then lets the API key's own workspace
+    apply, so a workspace id is optional for normal sessions.
+    """
     explicit = _string(explicit)
     if explicit:
         return explicit
@@ -159,26 +73,20 @@ def resolve_tenki_workspace_id(explicit: str = "") -> str:
         value = _scoped_env(env_name)
         if value:
             return value
-    if not _global_credential_fallback_allowed():
-        return ""
-    return _first_string(load_tenki_cli_config(), ("current_workspace_id", "workspace_id", "workspace"))
+    return ""
 
 
 def resolve_tenki_auth_token() -> str:
-    """Resolve a Tenki auth token/API key without logging or persisting it.
+    """The Tenki API key from ``TENKI_API_KEY`` (or ``TENKI_AUTH_TOKEN``).
 
-    Reads are profile-scope-aware (see :func:`_scoped_env`): under a
-    multiplexed gateway turn the active profile's secrets win, and the shared
-    machine ``tenki login`` credential is consulted only when no profile scope
-    is authoritative.
+    Passed to the SDK verbatim (``tk_...`` keys go out as bearer keys). Never
+    logged or persisted.
     """
-    for env_name in ("TENKI_AUTH_TOKEN", "TENKI_API_KEY"):
+    for env_name in TENKI_AUTH_ENV_VARS:
         value = _scoped_env(env_name)
         if value:
             return value
-    if not _global_credential_fallback_allowed():
-        return ""
-    return _find_secret_value(load_tenki_cli_config())
+    return ""
 
 
 def has_tenki_auth() -> bool:

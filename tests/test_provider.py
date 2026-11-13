@@ -181,13 +181,16 @@ def test_persistence_honors_explicit_config(capture_env, monkeypatch, tmp_path):
     assert capture_env.created_kwargs["persistent_filesystem"] is True
 
 
-def test_persistence_honors_explicit_dotenv(capture_env, monkeypatch):
+def test_persistence_ignores_dotenv_alone(capture_env, monkeypatch):
+    """Catalog rule 11: the plugin never reads ~/.hermes/.env, so a
+    TERMINAL_CONTAINER_PERSISTENT there (with nothing in config.yaml) no
+    longer opts into persistence; the terminate-only default stands."""
     import os
 
     with open(f"{os.environ['HERMES_HOME']}/.env", "w", encoding="utf-8") as fh:
         fh.write("TERMINAL_CONTAINER_PERSISTENT=true\n")
     TenkiProvider().create_environment(cwd="/root", timeout=60, task_id="t")
-    assert capture_env.created_kwargs["persistent_filesystem"] is True
+    assert capture_env.created_kwargs["persistent_filesystem"] is False
 
 
 def test_seed_process_defaults_exports_terminate_only(monkeypatch, tmp_path):
@@ -200,6 +203,19 @@ def test_seed_process_defaults_exports_terminate_only(monkeypatch, tmp_path):
     TenkiProvider.seed_process_defaults()
     import os
 
+    assert os.environ["TERMINAL_CONTAINER_PERSISTENT"] == "false"
+
+
+def test_seed_process_defaults_ignores_dotenv_persistence(monkeypatch, tmp_path):
+    """A .env-only TERMINAL_CONTAINER_PERSISTENT is not read by the plugin,
+    so it is not an explicit choice: terminate-only is still seeded."""
+    import os
+
+    _write_terminal_config(tmp_path, monkeypatch, "terminal:\n  backend: tenki\n")
+    with open(f"{os.environ['HERMES_HOME']}/.env", "w", encoding="utf-8") as fh:
+        fh.write("TERMINAL_CONTAINER_PERSISTENT=true\nTERMINAL_ENV=tenki\n")
+    monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "True")
+    TenkiProvider.seed_process_defaults()
     assert os.environ["TERMINAL_CONTAINER_PERSISTENT"] == "false"
 
 
@@ -264,12 +280,12 @@ def test_probe_reports_sdk_and_auth_readiness(monkeypatch, tmp_path):
     assert "SDK" in detail
 
     monkeypatch.setitem(sys.modules, "tenki", types.ModuleType("tenki"))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "absent.yaml"))
     status, detail = provider.probe()
     assert status == "needs_setup"
-    assert "credentials" in detail
+    assert "TENKI_API_KEY" in detail
+    assert "tenki auth token" in detail
 
-    monkeypatch.setenv("TENKI_AUTH_TOKEN", "tok")
+    monkeypatch.setenv("TENKI_API_KEY", "tk_test")
     assert provider.probe() == ("ready", "")
 
 
@@ -277,8 +293,7 @@ def test_doctor_checks_rows(monkeypatch, tmp_path):
     provider = TenkiProvider()
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setitem(sys.modules, "tenki", types.ModuleType("tenki"))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "absent.yaml"))
-    monkeypatch.setenv("TENKI_AUTH_TOKEN", "tok")
+    monkeypatch.setenv("TENKI_API_KEY", "tk_test")
     monkeypatch.setenv("TERMINAL_TENKI_WORKSPACE_ID", "ws-1")
 
     rows = provider.doctor_checks()
@@ -295,10 +310,7 @@ def test_registry_registration_and_terminal_dispatch(monkeypatch, tmp_path):
 
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n", encoding="utf-8"
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     provider = TenkiProvider()
     registry.register_provider(provider)
@@ -343,10 +355,13 @@ def test_registered_name_does_not_collide_with_builtins():
     assert TenkiProvider().name not in BUILTIN_BACKEND_NAMES
 
 
-def test_cli_api_key_is_not_wrapped_as_session_cookie():
-    """`tenki login` with an API key stores ``tk_...`` in auth_token; it must be
-    sent as a bearer key, not ``cookie:tk_...`` (the API answers 401)."""
-    from hermes_tenki.tenki_config import _normalize_cli_auth_token
-
-    assert _normalize_cli_auth_token("tk_example", "auth_token") == "tk_example"
-    assert _normalize_cli_auth_token("bare-session", "auth_token") == "cookie:bare-session"
+def test_auth_hints_point_at_tenki_api_key_not_cli_login(monkeypatch):
+    provider = TenkiProvider()
+    _clear_tenki_auth_env(monkeypatch)
+    monkeypatch.setitem(sys.modules, "tenki", types.ModuleType("tenki"))
+    texts = [provider.probe()[1], " ".join(provider.setup_instructions())]
+    texts += [detail for _ok, _label, detail in provider.doctor_checks()]
+    joined = "\n".join(texts)
+    assert "TENKI_API_KEY" in joined
+    assert "tenki auth token" in joined
+    assert "tenki login" not in joined

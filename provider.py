@@ -11,12 +11,13 @@ Configuration is read with this precedence, mirroring the in-core bridge
 semantics (config.yaml wins over stale process env):
 
 1. ``terminal.<key>`` in ``config.yaml``
-2. the ``TERMINAL_TENKI_*`` environment variable (e.g. from ``.env``)
+2. the ``TERMINAL_TENKI_*`` environment variable (Hermes loads ``.env``
+   into the process environment; the plugin never reads it itself)
 3. the default
 
 One deliberate divergence from core defaults: ``container_persistent``
 defaults to **False** for Tenki (terminate-only sandboxes) unless the user
-sets it explicitly in either source. Core's generic default of ``true``
+sets ``terminal.container_persistent`` explicitly in config.yaml. Core's generic default of ``true``
 cannot be distinguished from an explicit choice by the time it reaches
 ``container_config``, and a silently-persistent cloud sandbox is the wrong
 failure mode.
@@ -95,21 +96,6 @@ def _raw_terminal_settings() -> Dict[str, Any]:
     except Exception:
         logger.debug("Tenki provider: raw terminal config unavailable", exc_info=True)
         return {}
-
-
-def _dotenv_value(key: str) -> Optional[str]:
-    """The value ``~/.hermes/.env`` itself assigns to *key*, or ``None``.
-
-    Deliberately NOT the process environment: core's config→env bridge
-    backfills unset ``TERMINAL_*`` vars from merged-config defaults, so a
-    process-env value cannot prove user intent — a ``.env`` entry can.
-    """
-    try:
-        from hermes_cli.config import load_env
-
-        return load_env().get(key)
-    except Exception:
-        return None
 
 
 def _as_bool(value: Any, default: bool) -> bool:
@@ -237,13 +223,14 @@ class TenkiProvider(TerminalEnvironmentProvider):
                 )
                 return False
         try:
-            from .tenki_config import has_tenki_auth
+            from .tenki_config import TENKI_AUTH_HINT, has_tenki_auth
         except Exception:
             has_tenki_auth = lambda: False  # noqa: E731
+            TENKI_AUTH_HINT = "set TENKI_API_KEY in ~/.hermes/.env"
         if not has_tenki_auth():
             logger.error(
-                "Tenki backend selected but no Tenki auth was found. Run "
-                "`tenki login` or set TENKI_AUTH_TOKEN/TENKI_API_KEY."
+                "Tenki backend selected but no Tenki API key was found: %s.",
+                TENKI_AUTH_HINT,
             )
             return False
         return True
@@ -264,14 +251,18 @@ class TenkiProvider(TerminalEnvironmentProvider):
             return ("ready", "")
         return (
             "needs_setup",
-            "Tenki credentials not found — run `tenki login` or configure "
-            "TENKI_AUTH_TOKEN/TENKI_API_KEY.",
+            "Tenki credentials not found — set TENKI_API_KEY in ~/.hermes/.env "
+            "(`tenki auth token` prints a key from an existing Tenki CLI login).",
         )
 
     def doctor_checks(self) -> List[Tuple[bool, str, str]]:
         rows: List[Tuple[bool, str, str]] = []
         try:
-            from .tenki_config import has_tenki_auth, resolve_tenki_workspace_id
+            from .tenki_config import (
+                TENKI_AUTH_HINT,
+                has_tenki_auth,
+                resolve_tenki_workspace_id,
+            )
 
             if has_tenki_auth():
                 rows.append((True, "Tenki auth", "(configured)"))
@@ -279,7 +270,7 @@ class TenkiProvider(TerminalEnvironmentProvider):
                 rows.append((
                     False,
                     "Tenki auth not found",
-                    "(run `tenki login` or set TENKI_AUTH_TOKEN/TENKI_API_KEY)",
+                    f"({TENKI_AUTH_HINT})",
                 ))
             settings = _terminal_settings()
             workspace = resolve_tenki_workspace_id(
@@ -294,8 +285,8 @@ class TenkiProvider(TerminalEnvironmentProvider):
                 rows.append((
                     True,
                     "Tenki workspace",
-                    "(not configured — optional for sessions; required for "
-                    "volume-backed workflows)",
+                    "(not set — the API key's workspace is used; set "
+                    "terminal.tenki_workspace_id or TENKI_WORKSPACE_ID to pick one)",
                 ))
         except Exception as exc:
             rows.append((False, "Tenki configuration", f"(unreadable: {exc})"))
@@ -312,7 +303,8 @@ class TenkiProvider(TerminalEnvironmentProvider):
     def setup_instructions(self) -> List[str]:
         return [
             "Cloud sandboxes are created on demand and terminated by default.",
-            "Auth: run `tenki login`, or set TENKI_AUTH_TOKEN/TENKI_API_KEY.",
+            "Auth: set TENKI_API_KEY in ~/.hermes/.env (`tenki auth token` "
+            "prints a key from an existing Tenki CLI login).",
             "Settings live under `terminal:` in config.yaml — tenki_image, "
             "tenki_workspace_id, tenki_api_endpoint, tenki_max_duration, "
             "tenki_idle_timeout, tenki_pause_retention, tenki_sync_hermes_home, "
@@ -358,21 +350,27 @@ class TenkiProvider(TerminalEnvironmentProvider):
                 str(_setting(settings, "tenki_workspace_id", "TERMINAL_TENKI_WORKSPACE_ID") or "")
             )
             print(f"  Endpoint:  {endpoint}")
-            print(f"  Workspace: {workspace or '(not found; run tenki login)'}")
+            print(f"  Workspace: {workspace or '(API key default)'}")
             if has_tenki_auth():
                 print("  Tenki auth: already configured")
                 return
             print("  Tenki auth not found")
+            print(
+                "  Paste a Tenki API key (tk_...). With an existing Tenki CLI "
+                "login, `tenki auth token` prints one."
+            )
             import getpass
 
             token = getpass.getpass(
-                "  Tenki token/API key (optional; leave blank to run tenki login): "
+                "  TENKI_API_KEY (leave blank to set it later in ~/.hermes/.env): "
             )
             if token.strip():
                 from hermes_cli.config import save_env_value
 
                 save_env_value("TENKI_API_KEY", token.strip())
-                print("  Configured")
+                print("  Saved TENKI_API_KEY to ~/.hermes/.env")
+            else:
+                print("  Skipped — set TENKI_API_KEY in ~/.hermes/.env before use")
         except Exception as exc:
             print(f"  Tenki setup hook failed: {exc}")
 
@@ -496,19 +494,17 @@ class TenkiProvider(TerminalEnvironmentProvider):
     def _explicit_persistent_setting() -> Optional[bool]:
         """The user's explicit ``container_persistent`` choice, or ``None``.
 
-        Only two sources can prove intent: the key written in config.yaml
-        (raw view — the merged view carries core's generic ``true`` default)
-        and an assignment in ``~/.hermes/.env``. The process env var cannot:
-        core's config→env bridge backfills it from merged-config defaults,
-        and ``container_config["container_persistent"]`` arrives pre-filled
-        with the same default.
+        Only the key written in config.yaml (raw view — the merged view
+        carries core's generic ``true`` default) proves intent. The process
+        env var cannot: core's config→env bridge backfills it from
+        merged-config defaults, and ``container_config["container_persistent"]``
+        arrives pre-filled with the same default. The plugin does not read
+        ``.env`` files, so a ``TERMINAL_CONTAINER_PERSISTENT`` there alone
+        leaves the terminate-only default in place.
         """
         raw = _raw_terminal_settings()
         if "container_persistent" in raw:
             return _as_bool(raw["container_persistent"], False)
-        dotenv = _dotenv_value("TERMINAL_CONTAINER_PERSISTENT")
-        if dotenv is not None:
-            return _as_bool(dotenv, False)
         return None
 
     @classmethod
@@ -535,7 +531,6 @@ class TenkiProvider(TerminalEnvironmentProvider):
         try:
             backend = str(
                 _raw_terminal_settings().get("backend")
-                or _dotenv_value("TERMINAL_ENV")
                 or os.environ.get("TERMINAL_ENV")
                 or ""
             ).strip().lower()

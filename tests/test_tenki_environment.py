@@ -416,53 +416,86 @@ def _require_core_environment_registry():
             )
 
 
-def test_tenki_cli_auth_token_is_normalized_for_sdk_cookie_auth(monkeypatch, tmp_path):
+def test_tenki_auth_reads_api_key_then_auth_token_alias(monkeypatch):
     _clear_tenki_auth_env(monkeypatch)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: cli-cookie\n", encoding="utf-8")
+    from hermes_tenki.tenki_config import has_tenki_auth, resolve_tenki_auth_token
 
+    assert resolve_tenki_auth_token() == ""
+    assert has_tenki_auth() is False
+    monkeypatch.setenv("TENKI_AUTH_TOKEN", "tk_alias")
+    assert resolve_tenki_auth_token() == "tk_alias"
+    monkeypatch.setenv("TENKI_API_KEY", "tk_primary")
+    assert resolve_tenki_auth_token() == "tk_primary"
+
+
+def test_tenki_env_tokens_are_passed_through_verbatim(monkeypatch):
+    """No cookie wrapping or other normalization: a ``tk_`` key (and anything
+    else) reaches the SDK exactly as configured, so it goes out as a bearer key."""
+    _clear_tenki_auth_env(monkeypatch)
     from hermes_tenki.tenki_config import resolve_tenki_auth_token
 
-    assert resolve_tenki_auth_token() == "cookie:cli-cookie"
-
-
-def test_tenki_cli_auth_token_preserves_sdk_prefixes(monkeypatch, tmp_path):
-    _clear_tenki_auth_env(monkeypatch)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-
-    from hermes_tenki.tenki_config import resolve_tenki_auth_token
-
-    for token in ("cookie:cli-cookie", "ory_st_session", "sk-api-key"):
-        (tmp_path / "config.yaml").write_text(f"auth_token: {token}\n", encoding="utf-8")
+    for token in ("tk_example", "bare-session"):
+        monkeypatch.setenv("TENKI_API_KEY", token)
         assert resolve_tenki_auth_token() == token
 
 
-def test_tenki_cli_api_key_is_not_treated_as_cookie(monkeypatch, tmp_path):
+def test_tenki_cli_login_file_is_never_read(monkeypatch, tmp_path):
+    """Catalog rule 11: a Tenki CLI login (~/.config/tenki/config.yaml, or the
+    legacy TENKI_CONFIG_PATH override) must not supply auth, workspace or
+    endpoint, even when present."""
     _clear_tenki_auth_env(monkeypatch)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("api_key: provider-key\n", encoding="utf-8")
+    fake_home = tmp_path / "home"
+    cli_dir = fake_home / ".config" / "tenki"
+    cli_dir.mkdir(parents=True)
+    cli_config = cli_dir / "config.yaml"
+    cli_config.write_text(
+        "auth_token: tk_from_cli_login\n"
+        "api_key: tk_from_cli_login\n"
+        "current_workspace_id: ws-cli\n"
+        "api_endpoint: https://cli.tenki.test\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("TENKI_CONFIG_PATH", str(cli_config))
 
-    from hermes_tenki.tenki_config import resolve_tenki_auth_token
+    from hermes_tenki.tenki_config import (
+        TENKI_DEFAULT_API_ENDPOINT,
+        has_tenki_auth,
+        resolve_tenki_api_endpoint,
+        resolve_tenki_auth_token,
+        resolve_tenki_workspace_id,
+    )
 
-    assert resolve_tenki_auth_token() == "provider-key"
+    assert resolve_tenki_auth_token() == ""
+    assert has_tenki_auth() is False
+    assert resolve_tenki_workspace_id() == ""
+    assert resolve_tenki_api_endpoint() == TENKI_DEFAULT_API_ENDPOINT
 
 
-def test_tenki_environment_uses_cli_config_and_terminates_by_default(monkeypatch, tmp_path):
+def test_tenki_environment_refuses_to_start_without_api_key(monkeypatch, tmp_path):
+    """No key → fail before any lock/journal/RPC, with an actionable message
+    (and never let the SDK fall back to a raw os.environ read)."""
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "\n".join(
-            [
-                "api_endpoint: https://api.tenki.test",
-                "current_workspace_id: ws-123",
-                "auth_token: tok-secret",
-            ]
-        ),
-        encoding="utf-8",
-    )
+
+    from hermes_tenki.tenki_env import TenkiEnvironment
+
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+    with pytest.raises(RuntimeError, match="TENKI_API_KEY"):
+        TenkiEnvironment(task_id="no-auth")
+    assert _FakeSandboxFactory.created_kwargs == []
+
+
+def test_tenki_environment_uses_env_config_and_terminates_by_default(monkeypatch, tmp_path):
+    _install_fake_tenki(monkeypatch)
+    _clear_tenki_auth_env(monkeypatch)
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TENKI_API_ENDPOINT", "https://api.tenki.test")
+    monkeypatch.setenv("TENKI_WORKSPACE_ID", "ws-123")
+    monkeypatch.setenv("TENKI_API_KEY", "tk_secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -481,7 +514,8 @@ def test_tenki_environment_uses_cli_config_and_terminates_by_default(monkeypatch
     # The control-plane credential is used host-side to create the sandbox...
     assert kwargs["base_url"] == "https://api.tenki.test"
     assert kwargs["workspace_id"] == "ws-123"
-    assert kwargs["auth_token"] == "cookie:tok-secret"
+    # A tk_ API key reaches the SDK verbatim (sent as a bearer key).
+    assert kwargs["auth_token"] == "tk_secret"
     # ...but is NEVER injected into the model-controlled guest environment
     # (an empty env is omitted from the create kwargs entirely).
     guest_env = kwargs.get("env", {})
@@ -520,7 +554,6 @@ def test_tenki_environment_does_not_inject_control_plane_token_by_default(monkey
     _clear_env_passthrough_cache()
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "missing.yaml"))
     monkeypatch.setenv("TENKI_API_KEY", "sk-test-key")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -545,7 +578,6 @@ def test_tenki_environment_forwards_control_plane_token_only_when_opted_in(monke
     _clear_env_passthrough_cache()
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "missing.yaml"))
     monkeypatch.setenv("TENKI_API_KEY", "sk-test-key")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -566,12 +598,8 @@ def test_tenki_environment_honors_tenki_forward_env_from_process_env(monkeypatch
     _clear_env_passthrough_cache()
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
     monkeypatch.setenv("GH_TOKEN", "gho-process")
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -585,28 +613,24 @@ def test_tenki_environment_honors_tenki_forward_env_from_process_env(monkeypatch
     _clear_env_passthrough_cache()
 
 
-def test_tenki_environment_honors_tenki_forward_env_from_hermes_dotenv(monkeypatch, tmp_path):
+def test_tenki_forward_env_never_reads_hermes_dotenv_directly(monkeypatch, tmp_path):
+    """Catalog rule 11: forwarded values come from the (scoped) environment
+    Hermes populated, never from the plugin reading ~/.hermes/.env itself."""
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     _clear_env_passthrough_cache()
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     (tmp_path / ".env").write_text("GITHUB_TOKEN=ghp-dotenv\n", encoding="utf-8")
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
     monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
     env = TenkiEnvironment(task_id="github-token", forward_env=["GITHUB_TOKEN"])
 
-    assert _FakeSandboxFactory.created_kwargs[0]["env"]["GITHUB_TOKEN"] == "ghp-dotenv"
-    env.execute("echo ok", timeout=5)
-    assert env._sandbox.start_calls[-1][1]["env"]["GITHUB_TOKEN"] == "ghp-dotenv"
+    assert "GITHUB_TOKEN" not in _FakeSandboxFactory.created_kwargs[0].get("env", {})
     env.cleanup()
     _clear_env_passthrough_cache()
 
@@ -619,8 +643,7 @@ def test_tenki_forwarded_env_prefers_profile_scope_over_process_env(monkeypatch,
     _clear_env_passthrough_cache()
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
     # Another profile's value leaking through the process environment...
     monkeypatch.setenv("GH_TOKEN", "gho-other-profile")
 
@@ -628,7 +651,9 @@ def test_tenki_forwarded_env_prefers_profile_scope_over_process_env(monkeypatch,
     from hermes_tenki.tenki_env import TenkiEnvironment
 
     monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
-    token = secret_scope.set_secret_scope({"GH_TOKEN": "gho-this-profile"})
+    token = secret_scope.set_secret_scope(
+        {"GH_TOKEN": "gho-this-profile", "TENKI_API_KEY": "tok-this-profile"}
+    )
     try:
         monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
         env = TenkiEnvironment(task_id="scoped", forward_env=["GH_TOKEN"])
@@ -642,7 +667,6 @@ def test_tenki_forwarded_env_prefers_profile_scope_over_process_env(monkeypatch,
 
 def test_tenki_auth_token_prefers_profile_scope_over_process_env(monkeypatch, tmp_path):
     _clear_tenki_auth_env(monkeypatch)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "missing.yaml"))
     monkeypatch.setenv("TENKI_AUTH_TOKEN", "tok-other-profile")
 
     from agent import secret_scope
@@ -660,7 +684,6 @@ def test_tenki_auth_token_fails_closed_when_multiplex_active_and_unscoped(monkey
     """Multiplex on + no scope installed: an os.environ token must NOT leak
     through (fail closed), rather than serving another profile's value."""
     _clear_tenki_auth_env(monkeypatch)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "missing.yaml"))
     monkeypatch.setenv("TENKI_AUTH_TOKEN", "tok-leaked-from-process-env")
 
     from agent import secret_scope
@@ -673,13 +696,15 @@ def test_tenki_auth_token_fails_closed_when_multiplex_active_and_unscoped(monkey
 
 
 def test_tenki_forwarded_env_fails_closed_when_multiplex_active_and_unscoped(monkeypatch, tmp_path):
+    """Multiplex on + no scope installed: neither the control-plane key nor a
+    forwarded value may be read from the process env. The environment refuses
+    to start (no key), and the forwarding resolver yields nothing."""
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     _clear_env_passthrough_cache()
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-leaked-from-process-env")
     monkeypatch.setenv("GH_TOKEN", "gho-leaked-from-process-env")
 
     from agent import secret_scope
@@ -687,25 +712,23 @@ def test_tenki_forwarded_env_fails_closed_when_multiplex_active_and_unscoped(mon
 
     monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
     monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
-    env = TenkiEnvironment(task_id="scoped", forward_env=["GH_TOKEN"])
-
-    # No scope installed while multiplexing → the process-env value is not leaked.
-    assert "GH_TOKEN" not in _FakeSandboxFactory.created_kwargs[0].get("env", {})
-    env.cleanup()
+    assert secret_scope.current_secret_scope() is None
+    assert TenkiEnvironment._resolve_forwarded_env(["GH_TOKEN"]) == {}
+    with pytest.raises(RuntimeError, match="TENKI_API_KEY"):
+        TenkiEnvironment(task_id="scoped", forward_env=["GH_TOKEN"])
+    assert _FakeSandboxFactory.created_kwargs == []
     _clear_env_passthrough_cache()
 
 
-def test_tenki_control_plane_token_forwarded_from_cli_config_when_opted_in(monkeypatch, tmp_path):
-    """The opt-in must work even when auth came from `tenki login` (CLI config),
-    whose secret never lands in os.environ."""
+def test_tenki_control_plane_token_forwarded_under_alias_when_opted_in(monkeypatch, tmp_path):
+    """Listing TENKI_AUTH_TOKEN in tenki_forward_env forwards the resolved key
+    even when it was configured as TENKI_API_KEY."""
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     _clear_env_passthrough_cache()
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    # Credential lives ONLY in the Tenki CLI config, not the environment.
-    (tmp_path / "config.yaml").write_text("auth_token: tok-cli-login\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tk_configured")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -713,7 +736,7 @@ def test_tenki_control_plane_token_forwarded_from_cli_config_when_opted_in(monke
     env = TenkiEnvironment(task_id="nested", forward_env=["TENKI_AUTH_TOKEN"])
 
     guest_env = _FakeSandboxFactory.created_kwargs[0].get("env", {})
-    assert guest_env["TENKI_AUTH_TOKEN"] == "cookie:tok-cli-login"
+    assert guest_env["TENKI_AUTH_TOKEN"] == "tk_configured"
     env.cleanup()
     _clear_env_passthrough_cache()
 
@@ -724,10 +747,9 @@ def test_tenki_environment_honors_safe_env_passthrough(monkeypatch, tmp_path):
     _clear_env_passthrough_cache()
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
     monkeypatch.setenv("CUSTOM_TASK_ENV", "task-value")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
     (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n"
         "terminal:\n"
         "  env_passthrough:\n"
         "    - CUSTOM_TASK_ENV\n",
@@ -750,8 +772,7 @@ def test_tenki_environment_snapshots_when_persistent(monkeypatch, tmp_path):
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -781,11 +802,7 @@ def test_tenki_persistent_snapshot_retires_superseded_remote_copy(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -814,11 +831,7 @@ def test_tenki_snapshot_delete_failure_keeps_new_durable_pointer(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -880,11 +893,7 @@ def test_tenki_retirement_claim_is_durable_before_remote_delete(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -963,11 +972,7 @@ def test_tenki_windows_write_through_failure_keeps_remote_snapshot(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -1000,8 +1005,7 @@ def test_tenki_environment_falls_back_when_persistent_snapshot_is_stale(monkeypa
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -1030,11 +1034,7 @@ def test_tenki_snapshot_error_after_commit_never_creates_second_remote(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -1084,11 +1084,7 @@ def test_tenki_snapshot_preflight_rejects_returned_unusable_state(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -1137,11 +1133,7 @@ def test_tenki_snapshot_preflight_preserves_transition_state(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -1175,8 +1167,7 @@ def test_tenki_environment_preserves_snapshot_on_transient_restore_error(monkeyp
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -1205,11 +1196,7 @@ def test_tenki_readiness_error_keeps_exact_snapshot_remote_and_pointer(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -1245,8 +1232,7 @@ def test_tenki_environment_skips_snapshot_when_not_durable(monkeypatch, tmp_path
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -1292,11 +1278,7 @@ def test_tenki_snapshot_pointer_failure_preserves_prior_and_retires_new_copy(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -1329,11 +1311,7 @@ def test_tenki_directory_fsync_uncertainty_keeps_both_snapshots_and_live_sandbox
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -1376,8 +1354,7 @@ def test_tenki_environment_refuses_unmanaged_persistent_sandbox(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -1418,11 +1395,7 @@ def test_tenki_unidentified_collision_is_durably_unresolvable(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -1472,11 +1445,7 @@ def test_tenki_mixed_unmanaged_collision_preserves_known_ids(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -1527,11 +1496,7 @@ def test_tenki_registration_loser_sharing_remote_releases_only_wrapper(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from tools import terminal_tool
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -1586,11 +1551,7 @@ def test_tenki_persistent_list_failure_never_authorizes_creation(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -1614,11 +1575,7 @@ def test_tenki_exact_binding_survives_list_omission_on_create_and_restart(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -1666,11 +1623,7 @@ def test_tenki_persistent_readiness_errors_preserve_exact_sandbox(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -1699,11 +1652,7 @@ def test_tenki_unmanaged_persistent_remote_never_resumes_or_forks(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -1769,11 +1718,7 @@ def test_tenki_migrates_legacy_profile_snapshot_key(monkeypatch, tmp_path):
     profile_home.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(profile_home))
     monkeypatch.setenv("HERMES_PROFILE", "coder")
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -1854,11 +1799,7 @@ def test_tenki_legacy_pointer_migration_failure_keeps_restored_sandbox(
     profile_home.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(profile_home))
     monkeypatch.setenv("HERMES_PROFILE", "coder")
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -1926,11 +1867,7 @@ def test_tenki_refuses_legacy_profile_named_sandbox(monkeypatch, tmp_path):
     profile_home.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(profile_home))
     monkeypatch.setenv("HERMES_PROFILE", "coder")
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -1973,8 +1910,7 @@ def test_tenki_environment_does_not_reuse_other_profiles_sandbox(monkeypatch, tm
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -2003,8 +1939,7 @@ def test_tenki_reuse_rejects_name_match_with_foreign_profile_metadata(monkeypatc
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -2032,8 +1967,7 @@ def test_tenki_restore_falls_back_on_nondurable_snapshot(monkeypatch, tmp_path):
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -2058,8 +1992,7 @@ def test_tenki_restore_preserves_pointer_on_invalid_state_error(monkeypatch, tmp
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -2084,8 +2017,7 @@ def test_tenki_restore_falls_back_on_snapshot_specific_invalid_state(monkeypatch
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -2111,8 +2043,7 @@ def test_tenki_snapshot_store_bound_to_construction_profile(monkeypatch, tmp_pat
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -2145,9 +2076,7 @@ def test_tenki_sync_enumeration_and_cleanup_stay_bound_to_owner_profile(
     process_home = tmp_path / "process-home"
     process_home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(process_home))
-    tenki_config = tmp_path / "tenki-cli.yaml"
-    tenki_config.write_text("auth_token: tok-secret\n", encoding="utf-8")
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tenki_config))
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_cli import config as hermes_config
     from hermes_constants import (
@@ -2275,11 +2204,7 @@ def test_tenki_malformed_recovery_registry_fails_closed(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
     store = tmp_path / "tenki_snapshots.json"
     malformed = '{"direct:task":"sole-snapshot"'
     store.write_text(malformed, encoding="utf-8")
@@ -2426,11 +2351,7 @@ def test_tenki_task_ownership_lock_spans_wrapper_lifetime(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -2465,11 +2386,7 @@ def test_tenki_failed_initialization_quiesces_before_releasing_ownership(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -2516,11 +2433,7 @@ def test_tenki_failed_initialization_quarantines_unsafe_task_lock(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -2580,11 +2493,7 @@ def test_tenki_ambiguous_create_is_reconciled_before_ownership_release(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -2626,11 +2535,7 @@ def test_tenki_unreconciled_ambiguous_create_quarantines_task_lock(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -2673,11 +2578,7 @@ def test_tenki_ambiguous_persistent_lineages_are_never_terminated(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -2781,11 +2682,7 @@ def test_tenki_unmanaged_collision_remains_durable_when_list_omits_remote(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -2837,11 +2734,7 @@ def test_tenki_known_conflict_clears_only_after_exact_remote_is_terminal(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -2888,11 +2781,7 @@ def test_tenki_terminal_binding_is_authoritatively_cleared_after_crash(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -2927,11 +2816,7 @@ def test_tenki_local_create_rejection_clears_attempt_before_retry(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -2975,11 +2860,7 @@ def test_tenki_post_commit_value_error_retains_attempt_and_blocks_duplicate(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -3046,11 +2927,7 @@ def test_tenki_expired_empty_attempt_cannot_lock_task_forever(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -3082,11 +2959,7 @@ def test_tenki_terminal_list_row_requires_authoritative_get_before_clear(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -3141,11 +3014,7 @@ def test_tenki_expired_attempt_never_adopts_unmanaged_match(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -3209,11 +3078,7 @@ def test_tenki_hidden_exact_conflict_preserves_visible_known_id(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -3262,11 +3127,7 @@ def test_tenki_unvalidated_binding_requires_durable_expected_attempt(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -3327,11 +3188,7 @@ def test_tenki_transient_bound_id_lookup_never_falls_back_to_create(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -3379,11 +3236,7 @@ def test_tenki_unvalidated_binding_stays_fail_closed_when_list_omits_remote(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -3479,11 +3332,7 @@ def test_tenki_post_create_mixed_conflict_preserves_known_ids(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -3544,11 +3393,7 @@ def test_tenki_runtime_recreate_reconciles_ambiguous_commit_before_retry(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -3586,8 +3431,7 @@ def test_tenki_persistent_not_terminated_when_snapshot_and_pause_both_fail(monke
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -3620,8 +3464,7 @@ def test_tenki_environment_resumes_paused_cached_sandbox_before_execute(monkeypa
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -3643,8 +3486,7 @@ def test_tenki_environment_recreates_terminated_cached_sandbox(monkeypatch, tmp_
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -3665,8 +3507,7 @@ def test_tenki_environment_ignores_mismatched_persistent_sandbox(monkeypatch, tm
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
     _FakeClient.listed_sandboxes = [
         _FakeSandbox(
             name="hermes-other",
@@ -3689,8 +3530,7 @@ def test_tenki_environment_converts_idle_timeout_to_sdk_minutes(monkeypatch, tmp
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -3707,8 +3547,7 @@ def test_tenki_environment_passes_sdk_resource_boundaries(monkeypatch, tmp_path)
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -3733,8 +3572,7 @@ def test_tenki_environment_omits_resources_outside_sdk_bounds(monkeypatch, tmp_p
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -3757,8 +3595,7 @@ def test_tenki_environment_omits_unaligned_sdk_memory(monkeypatch, tmp_path):
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -3777,8 +3614,7 @@ def test_tenki_environment_omits_non_positive_pause_retention(monkeypatch, tmp_p
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -3799,8 +3635,7 @@ def test_tenki_environment_passes_positive_pause_retention(monkeypatch, tmp_path
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -3816,8 +3651,7 @@ def test_tenki_sync_hermes_home_is_opt_in(monkeypatch, tmp_path):
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -3852,8 +3686,7 @@ def test_tenki_bulk_sync_stages_tar_under_home_not_tmp(monkeypatch, tmp_path):
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -3874,8 +3707,7 @@ def test_tenki_bulk_sync_uses_documented_fs_root_when_home_differs(monkeypatch, 
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -3895,8 +3727,7 @@ def test_tenki_cleanup_sync_back_uses_original_sandbox(monkeypatch, tmp_path):
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -3923,8 +3754,7 @@ def test_tenki_cleanup_blocks_public_execution_while_syncing(monkeypatch, tmp_pa
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -3956,8 +3786,7 @@ def test_tenki_require_sandbox_rejects_cleanup_claimed_in_capture_gap(monkeypatc
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -4007,8 +3836,7 @@ def test_tenki_ephemeral_cleanup_closes_environment_owned_client(monkeypatch, tm
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -4035,8 +3863,7 @@ def test_tenki_failed_termination_remains_retryable_and_tracked(
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("TERMINAL_ENV", "tenki")
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from tools import terminal_tool
     import hermes_tenki.tenki_env as tenki_module
@@ -4085,8 +3912,7 @@ def test_tenki_concurrent_cleanup_terminates_and_closes_once(monkeypatch, tmp_pa
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -4143,8 +3969,7 @@ def test_tenki_cleanup_waits_for_cancel_before_closing_client(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -4206,11 +4031,7 @@ def test_tenki_persistent_cancel_never_terminates_when_pause_fails(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -4246,11 +4067,7 @@ def test_tenki_persistent_cancel_blocks_ensure_and_reuses_exact_sandbox(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -4321,11 +4138,7 @@ def test_tenki_completed_cancel_generation_rechecks_before_lease(
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text(
-        "auth_token: tok-secret\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     import hermes_tenki.tenki_env as tenki_module
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -4607,8 +4420,7 @@ def test_tenki_execute_passes_stdin_natively_not_as_heredoc(monkeypatch, tmp_pat
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -4631,8 +4443,7 @@ def test_tenki_cancel_kills_process_without_tearing_down_sandbox(monkeypatch, tm
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -4659,8 +4470,7 @@ def test_tenki_non_sudo_command_does_not_probe_sudo(monkeypatch, tmp_path):
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -4682,8 +4492,7 @@ def test_tenki_passwordless_sudo_does_not_prompt_or_rewrite(monkeypatch, tmp_pat
     monkeypatch.delenv("SUDO_PASSWORD", raising=False)
     monkeypatch.setenv("HERMES_INTERACTIVE", "1")
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -4711,8 +4520,7 @@ def test_tenki_sudo_without_passwordless_policy_fails_fast_without_host_password
     monkeypatch.setenv("SUDO_PASSWORD", "host-secret")
     monkeypatch.setenv("HERMES_INTERACTIVE", "1")
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
-    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+    monkeypatch.setenv("TENKI_API_KEY", "tok-secret")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
 
@@ -4742,7 +4550,6 @@ def test_exec_survives_cancel_clearing_sandbox_mid_operation(monkeypatch, tmp_pa
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "missing.yaml"))
     monkeypatch.setenv("TENKI_API_KEY", "sk-test-key")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -4773,7 +4580,6 @@ def _tenki_env_for_upload_race(monkeypatch, tmp_path, task_id):
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "missing.yaml"))
     monkeypatch.setenv("TENKI_API_KEY", "sk-test-key")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -4849,7 +4655,6 @@ def test_tenki_create_kwargs_filters_names_the_installed_sdk_dropped(monkeypatch
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "missing.yaml"))
     monkeypatch.setenv("TENKI_API_KEY", "sk-test-key")
 
     # A deliberately narrow client: no cpu_cores/memory_mb/disk_size_gb/
@@ -4980,7 +4785,6 @@ def test_gateway_task_ids_create_sandbox_names_tenki_can_provision(monkeypatch, 
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "missing.yaml"))
     monkeypatch.setenv("TENKI_API_KEY", "sk-test-key")
 
     from hermes_tenki.tenki_env import TenkiEnvironment
@@ -4995,3 +4799,19 @@ def test_gateway_task_ids_create_sandbox_names_tenki_can_provision(monkeypatch, 
 
     assert all(len(name) <= 64 for name in names)
     assert names[0] != names[1]
+
+
+def test_env_tk_api_key_goes_to_installed_sdk_as_bearer_key(monkeypatch):
+    """A ``tk_`` key from TENKI_API_KEY reaches the real SDK verbatim and is
+    sent as ``Authorization: Bearer tk_...`` (no cookie wrapping)."""
+    pytest.importorskip("tenki")
+    transport = pytest.importorskip("tenki_sandbox._transport")
+    _clear_tenki_auth_env(monkeypatch)
+    monkeypatch.setenv("TENKI_API_KEY", "tk_contract-test")
+
+    from hermes_tenki.tenki_config import resolve_tenki_auth_token
+
+    token = resolve_tenki_auth_token()
+    assert token == "tk_contract-test"
+    metadata = dict(transport.auth_metadata(token))
+    assert metadata["authorization"] == "Bearer tk_contract-test"

@@ -111,7 +111,7 @@ SDK is installed and still makes no network calls):
 
 ```bash
 git clone https://github.com/NousResearch/hermes-agent
-cd hermes-agent && uv sync --extra dev && cd -
+cd hermes-agent && uv sync --group dev && cd -
 uv pip install --python hermes-agent/.venv/bin/python 'tenki>=1.4.1,<2'
 hermes-agent/.venv/bin/python -m pytest tests/
 ```

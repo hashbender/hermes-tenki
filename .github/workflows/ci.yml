@@ -25,7 +25,7 @@ jobs:
 
       - name: Install hermes-agent
         working-directory: hermes-agent
-        run: uv sync --extra dev
+        run: uv sync --group dev
 
       - name: Install tenki SDK
         working-directory: hermes-agent

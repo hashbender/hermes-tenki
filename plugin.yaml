@@ -1,20 +1,23 @@
 name: tenki
-version: 1.0.0
+version: 1.1.0
 description: "Tenki cloud sandbox terminal backend (select with terminal.backend: tenki)"
 author: hashbender
 kind: backend
 # manifest_version deliberately omitted (defaults to 1): `hermes plugins
 # install` refuses manifests newer than its own max (1 on current cores),
 # while the v2-era fields below parse fine on a v1 manifest.
+requires_hermes: ">=0.22.5"
 license: MIT
 homepage: https://github.com/hashbender/hermes-tenki
 tags: [terminal, sandbox, cloud]
 python_dependencies:
   - "tenki>=1.4.1,<2"
+requires_env:
+  - name: TENKI_API_KEY
+    description: Tenki API key (tk_...). `tenki auth token` prints one from an existing Tenki CLI login.
+    url: https://tenki.cloud
+    secret: true
 optional_env:
   - name: TENKI_AUTH_TOKEN
-    description: Tenki auth token (alternatives - TENKI_API_KEY, or `tenki login`)
-    secret: true
-  - name: TENKI_API_KEY
-    description: Tenki API key (alternative to TENKI_AUTH_TOKEN / `tenki login`)
+    description: Alias for TENKI_API_KEY (used only when TENKI_API_KEY is unset)
     secret: true

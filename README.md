@@ -28,10 +28,24 @@ The installer's security scan will show a *caution* summary and ask for
 confirmation — expected for a sandbox backend: the code legitimately
 rewrites `sudo` invocations and drives the sandbox's remote `exec` API.
 
-Auth (any one of):
+Auth: set `TENKI_API_KEY` in `~/.hermes/.env` (the installer prompts for
+it). If you already use the Tenki CLI, `tenki auth token` prints a key you can
+paste. `TENKI_AUTH_TOKEN` is accepted as an alias when `TENKI_API_KEY` is
+unset. The plugin reads these only through Hermes's secret scope, so each
+profile uses its own key; it never reads the Tenki CLI's login file.
 
-- `tenki login` (uses the Tenki CLI's config)
-- `TENKI_AUTH_TOKEN` or `TENKI_API_KEY` in the environment or `~/.hermes/.env`
+Optional: `TENKI_WORKSPACE_ID` (or `terminal.tenki_workspace_id`) picks a
+workspace; without it the API key's own workspace is used.
+`TENKI_API_ENDPOINT` overrides the API endpoint.
+
+> **Breaking change in 1.1.0.** Earlier versions also picked up a `tenki
+> login` session (and its workspace and endpoint) from
+> `~/.config/tenki/config.yaml`, and read `TERMINAL_CONTAINER_PERSISTENT`
+> straight from `~/.hermes/.env`. Neither happens any more (Hermes plugin
+> catalog rule 11). If you relied on `tenki login`, run
+> `tenki auth token` and put the result in `~/.hermes/.env` as
+> `TENKI_API_KEY`; if you set persistence in `.env`, move it to
+> `terminal.container_persistent: true` in config.yaml.
 
 The `tenki` Python SDK (`tenki>=1.4.1,<2`) is installed on demand through
 hermes-agent's lazy-install pipeline, or install it yourself with
@@ -40,14 +54,14 @@ hermes-agent's lazy-install pipeline, or install it yourself with
 ## Configuration
 
 All settings live under `terminal:` in `config.yaml`. Each also has an
-environment-variable form (useful for `~/.hermes/.env`); config.yaml wins
-when both are set.
+environment-variable form (useful for `~/.hermes/.env`, which Hermes loads
+into the environment); config.yaml wins when both are set.
 
 | config.yaml key | env var | default | meaning |
 |---|---|---|---|
 | `tenki_image` | `TERMINAL_TENKI_IMAGE` | Tenki workspace default | sandbox image/template |
-| `tenki_api_endpoint` | `TERMINAL_TENKI_API_ENDPOINT` | `https://api.tenki.cloud` | API endpoint |
-| `tenki_workspace_id` | `TERMINAL_TENKI_WORKSPACE_ID` | from `tenki login` | workspace |
+| `tenki_api_endpoint` | `TERMINAL_TENKI_API_ENDPOINT` | `TENKI_API_ENDPOINT`, else `https://api.tenki.cloud` | API endpoint |
+| `tenki_workspace_id` | `TERMINAL_TENKI_WORKSPACE_ID` | `TENKI_WORKSPACE_ID`, else the API key's workspace | workspace |
 | `tenki_name_prefix` | `TERMINAL_TENKI_NAME_PREFIX` | `hermes` | sandbox name prefix |
 | `tenki_allow_inbound` | `TERMINAL_TENKI_ALLOW_INBOUND` | `false` | allow inbound network |
 | `tenki_allow_outbound` | `TERMINAL_TENKI_ALLOW_OUTBOUND` | `true` | allow outbound network |
@@ -57,7 +71,7 @@ when both are set.
 | `tenki_sync_hermes_home` | `TERMINAL_TENKI_SYNC_HERMES_HOME` | `false` | mirror `~/.hermes` into the sandbox |
 | `tenki_forward_env` | `TERMINAL_TENKI_FORWARD_ENV` | `[]` | env var names forwarded into the sandbox |
 | `container_cpu` / `container_memory` / `container_disk` | `TERMINAL_CONTAINER_*` | 1 / 5120 MB / 51200 MB | sandbox resources |
-| `container_persistent` | `TERMINAL_CONTAINER_PERSISTENT` | **`false`** | snapshot + reuse the sandbox across sessions |
+| `container_persistent` | (config.yaml only) | **`false`** | snapshot + reuse the sandbox across sessions |
 | `cwd` | `TERMINAL_CWD` | `/home/tenki` | working directory (guest paths under `/home/tenki` only) |
 
 Notes:
@@ -65,11 +79,10 @@ Notes:
 - **Terminate-only by default.** Unlike container backends, an unset
   `container_persistent` means the sandbox is terminated at session end
   (after a durable snapshot when persistence *is* enabled). Set
-  `terminal.container_persistent: true` in config.yaml (or
-  `TERMINAL_CONTAINER_PERSISTENT=true` in `~/.hermes/.env`) explicitly to
-  keep state. A plain shell-exported variable is deliberately ignored for
-  this one key: core's config bridge backfills it from generic defaults, so
-  a process-env value can't prove user intent.
+  `terminal.container_persistent: true` in config.yaml explicitly to keep
+  state. `TERMINAL_CONTAINER_PERSISTENT` (shell or `.env`) is deliberately
+  ignored for this one key: core's config bridge backfills it from generic
+  defaults, so an environment value can't prove user intent.
 - **Credentials never enter the sandbox** unless you opt in: the control
   plane token (`TENKI_AUTH_TOKEN`/`TENKI_API_KEY`) is stripped from every
   agent subprocess and is only forwarded into the guest if you list it in
@@ -81,6 +94,29 @@ Notes:
   `TENKI_AUTH_TOKEN`/`TENKI_API_KEY` from `~/.hermes/.env`: the subprocess
   secret-stripping the plugin registers only applies while it is loaded, so
   a leftover token would become readable by model-authored shell commands.
+
+## What the plugin does on your machine
+
+- **Network:** calls the Tenki API (`https://api.tenki.cloud`, or your
+  `TENKI_API_ENDPOINT`) to create, run commands in, snapshot, pause and
+  terminate sandboxes. Sandboxes are billed to the account that owns the API
+  key. No telemetry.
+- **Credentials:** reads `TENKI_API_KEY`/`TENKI_AUTH_TOKEN` through Hermes's
+  secret scope only. `hermes setup terminal` offers to save a pasted key to
+  `~/.hermes/.env` through Hermes's own `save_env_value`.
+- **Files:** writes its state under `HERMES_HOME`: `tenki_snapshots.json`
+  (snapshot pointers and create-attempt journal) and per-task lock files in
+  `locks/tenki/`. With `tenki_sync_hermes_home` or
+  `terminal.credential_files` it uploads those files into the sandbox.
+- **Process environment:** when `terminal.backend` is `tenki` and
+  `terminal.container_persistent` is not set in config.yaml, it sets
+  `TERMINAL_CONTAINER_PERSISTENT=false` in the Hermes process at load so
+  core's session isolation matches the terminate-only default.
+- **Shell:** commands run in the remote sandbox, not on the host. When the
+  sandbox lacks passwordless sudo, `sudo` is rewritten to `sudo -n` there;
+  `SUDO_PASSWORD` is never sent to the sandbox.
+- **Signals:** while syncing files back from the sandbox on the main thread
+  it briefly defers `SIGINT` and restores the previous handler afterwards.
 
 ## Core version compatibility
 

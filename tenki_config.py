@@ -4,7 +4,7 @@ Every value comes from Hermes: explicit ``terminal.tenki_*`` config, or an
 environment variable read through :func:`agent.secret_scope.get_secret` (which
 honours the active profile under a multiplexed gateway). The plugin never
 reads the Tenki CLI's own config/login file or any ``.env`` file; Hermes loads
-``~/.hermes/.env`` itself. Users who already ran ``tenki login`` can print a
+``~/.hermes/.env`` itself. Users with an existing Tenki CLI login can print a
 key for ``TENKI_API_KEY`` with ``tenki auth token``.
 """
 
